@@ -3,6 +3,10 @@
 **Bachelor's Thesis — ZHAW School of Life Sciences, 2026**  
 In collaboration with Kantonsspital Winterthur (KSW)
 
+> **🇨🇭 KSW-Variante (dieses Repository):** Das semi-automatische Slicer-Modul wurde vereinfacht – **nur 3D Slicer, kein Python, kein Dashboard, Resultate als CSV**.
+> 👉 **[Kurzanleitung: Semi-Automated Pipeline/ANLEITUNG.md](Semi-Automated%20Pipeline/ANLEITUNG.md)**
+> Basierend auf [IleniaGiannini/Quantitative-Soft-Tissue-Analysis-in-Medical-Imaging](https://github.com/IleniaGiannini/Quantitative-Soft-Tissue-Analysis-in-Medical-Imaging). Die automatisierte Pipeline ist unverändert.
+
 > **⚠️ Research Prototype**  
 > This software is a research prototype developed as part of a Bachelor's thesis. It must **not** be used for clinical decision-making without further validation.
 

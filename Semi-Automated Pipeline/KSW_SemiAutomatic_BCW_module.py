@@ -33,8 +33,10 @@
 # 6. Derive IMAT automatically from fat-image intensities inside the muscle mask.
 # 7. Compute 2D metrics such as SAT area, VAT area, SMA, SMI, VAT/SAT ratio,
 #    SAT/VAT indices and IMAT percentage.
-# 8. Export images, segmentation and metrics to the dashboard output folder.
-# 9. Launch the dashboard for visualization and report generation.
+# 8. Export the metrics as CSV (one file per patient + one cumulative file).
+#
+# CSV-only variant: no dashboard, no external Python, no extra packages.
+# Everything runs inside 3D Slicer.
 #
 # Notes and limitations
 # ---------------------
@@ -55,10 +57,8 @@
 # Standard library imports
 import os
 import csv
-import time
-import shutil
-import subprocess
-import webbrowser
+import datetime
+import re
 
 # Numerical processing
 import numpy as np
@@ -101,8 +101,7 @@ class KSW_SemiAutomatic_BCW_moduleWidget(ScriptedLoadableModuleWidget):
     User interface for the body composition workflow.
 
     This widget contains all input selectors, workflow buttons,
-    the embedded Segment Editor and export functions for the
-    Dashboard.
+    the embedded Segment Editor and the CSV export.
     """
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
@@ -289,7 +288,7 @@ class KSW_SemiAutomatic_BCW_moduleWidget(ScriptedLoadableModuleWidget):
             "For 3D volumes, scroll to the desired L3 slice in the Red slice viewer "
             "and then press the Auto-detect button to store this slice index. "
             "The same selected slice index is used for the fat image, water image, "
-            "segmentation, metric calculation and dashboard export. "
+            "segmentation, metric calculation and CSV export. "
             "No automatic fat-water slice offset is applied."
         )
         
@@ -435,30 +434,39 @@ class KSW_SemiAutomatic_BCW_moduleWidget(ScriptedLoadableModuleWidget):
         formLayout.addRow(self.runIMATButton)
 
         # ---------- Metrics ----------
-        addSection("6. Metrics and export")
+        addSection("6. Metrics and CSV export")
         addText(
-            "Computes quantitative metrics on the selected shared L3 slice, including "
-            "SAT area, VAT area, Muscle area, VAT/SAT ratio, SMI and IMAT%. "
-            "The fat image, water image, segmentation and CSV results are exported "
-            "to the dashboard output folder."
+            "Computes SAT area, VAT area, muscle area (SMA), IMAT, VAT/SAT ratio, "
+            "SMI and SAT/VAT indices on the selected L3 slice and saves them as CSV: "
+            "one file per patient and one row appended to body_composition_all.csv."
         )
-        self.computeMetricsButton = qt.QPushButton("Compute Metrics + Export to Dashboard")
+
+        self.outputDirSelector = ctk.ctkPathLineEdit()
+        self.outputDirSelector.filters = ctk.ctkPathLineEdit.Dirs
+        self.outputDirSelector.settingKey = "KSW_BCW/OutputDirectory"
+        if not self.outputDirSelector.currentPath:
+            self.outputDirSelector.currentPath = os.path.join(
+                os.path.expanduser("~"), "Documents", "KSW_BodyComposition")
+        formLayout.addRow("Output folder:", self.outputDirSelector)
+
+        self.saveSegmentationCheckBox = qt.QCheckBox(
+            "Also save segmentation (.seg.nrrd) for later review")
+        self.saveSegmentationCheckBox.checked = False
+        formLayout.addRow("", self.saveSegmentationCheckBox)
+
+        self.computeMetricsButton = qt.QPushButton("Compute Metrics + Export CSV")
         self.computeMetricsButton.clicked.connect(self.onComputeMetrics)
         self.computeMetricsButton.setStyleSheet(buttonStyle)
         formLayout.addRow(self.computeMetricsButton)
 
+        self.openOutputFolderButton = qt.QPushButton("Open output folder")
+        self.openOutputFolderButton.clicked.connect(self.onOpenOutputFolder)
+        self.openOutputFolderButton.setStyleSheet(secondaryButtonStyle)
+        formLayout.addRow(self.openOutputFolderButton)
+
         self.statusLabel = qt.QLabel("Ready.")
         self.statusLabel.setWordWrap(True)
         formLayout.addRow("Status:", self.statusLabel)
-
-        addText(
-            "Then open the Dashboard for visualization, reports and metric analysis."
-        )
-
-        self.openDashboardButton = qt.QPushButton("Open Dashboard")
-        self.openDashboardButton.clicked.connect(self.onOpenDashboard)
-        self.openDashboardButton.setStyleSheet(buttonStyle)
-        formLayout.addRow(self.openDashboardButton)
 
         # ---------- Reset ----------
         addSection("7. Reset workflow")
@@ -873,7 +881,7 @@ class KSW_SemiAutomatic_BCW_moduleWidget(ScriptedLoadableModuleWidget):
             "Use the embedded Segment Editor."
         )
 
-    # ── IMAT, metrics, dashboard and reset handlers ────────────────────────────
+    # ── IMAT, metrics, CSV export and reset handlers ────────────────────────────
 
     def onRunIMATWorkflow(self):
         """Create IMAT from fat intensities inside the Muscle segment.
@@ -958,11 +966,9 @@ class KSW_SemiAutomatic_BCW_moduleWidget(ScriptedLoadableModuleWidget):
 
     def onComputeMetrics(self):
         """
-        Compute metrics and export the current patient data for the dashboard.
+        Compute metrics on the workflow slice and export them as CSV.
 
         All workflow segments are evaluated on the detected workflow slice.
-        For 3-slice datasets, the dashboard export may shift image and segmentation
-        copies together so that the dashboard displays the correct anatomical slice.
         """
         fatNode, waterNode, segmentationNode = self.getCurrentNodes()
 
@@ -1008,110 +1014,59 @@ class KSW_SemiAutomatic_BCW_moduleWidget(ScriptedLoadableModuleWidget):
             birth_year=birthYear
         )
 
-        scriptDir = os.path.dirname(os.path.abspath(__file__))
-
-        # Export to the folder structure expected by dashboard.py.
-        patientDir = os.path.join(scriptDir, "Dashboard", "current_patient")
-        outputDir = os.path.join(patientDir, "output")
-        niftiDir = os.path.join(outputDir, "nifti")
-        os.makedirs(niftiDir, exist_ok=True)
-
         workflowSliceIndex = int(metrics.get("slice_index", sliceIndex))
+        metrics["slice_index"] = workflowSliceIndex
+        metrics.pop("water_slice_index", None)
+        metrics.pop("fat_slice_index", None)
+        metrics["processing_mode"] = mode
+        metrics["fat_image"] = fatNode.GetName()
+        metrics["water_image"] = waterNode.GetName() if waterNode else ""
+        metrics["export_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        referenceNode = fatNode
-        referenceDepth = slicer.util.arrayFromVolume(referenceNode).shape[0]
-
-        # True slice where the segmentation and metrics were created.
-        # This is the source slice that will be read from the Slicer segmentation.
-        exportSourceSliceIndex = workflowSliceIndex
-
-        # Slice that the dashboard should display.
-        # For normal volumes this is the same as the workflow slice.
-        # For 3-slice datasets, the dashboard displays 1-based style indexing,
-        # therefore the output slice is shifted by +1.
-        dashboardSliceIndex = workflowSliceIndex
-
-        if referenceDepth <= 3:
-            dashboardSliceIndex = int(np.clip(workflowSliceIndex + 1, 0, referenceDepth - 1))
-
-        metrics["workflow_slice_index"] = workflowSliceIndex
-        metrics["dashboard_slice_index"] = dashboardSliceIndex
-
-        # Important:
-        # The dashboard may read "slice_index" from the CSV.
-        # Therefore, store the dashboard display slice here.
-        metrics["slice_index"] = dashboardSliceIndex
-        metrics["water_slice_index"] = dashboardSliceIndex
-        metrics["fat_slice_index"] = dashboardSliceIndex
-
-        sliceIndexPath = os.path.join(outputDir, "dashboard_start_slice.txt")
-
-        with open(sliceIndexPath, "w", encoding="utf-8") as f:
-            f.write(str(dashboardSliceIndex))
-
-        print(
-            f"[Dashboard export] Final dashboard start slice written: "
-            f"{dashboardSliceIndex}"
-        )
+        outputDir = self.outputDirSelector.currentPath.strip()
+        if not outputDir:
+            slicer.util.errorDisplay("Please choose an output folder.")
+            return
 
         try:
-            with open(sliceIndexPath, "r", encoding="utf-8") as f:
-                print(
-                    f"[Dashboard export check] dashboard_start_slice.txt = "
-                    f"{f.read().strip()}"
-                )
+            os.makedirs(outputDir, exist_ok=True)
+            self.outputDirSelector.addCurrentPathToHistory()
+
+            safeName = re.sub(r"[^A-Za-z0-9_-]+", "_", patientName).strip("_") or "patient"
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            patientCsv = os.path.join(outputDir, f"{safeName}_{stamp}_body_composition.csv")
+
+            self.logic.exportMetrics(metrics, patientCsv)
+            allCsv = os.path.join(outputDir, "body_composition_all.csv")
+            self.logic.appendMetrics(metrics, allCsv)
+
+            message = f"CSV saved:\n{patientCsv}\n\nAppended to:\n{allCsv}"
+
+            if self.saveSegmentationCheckBox.checked:
+                segPath = os.path.join(outputDir, f"{safeName}_{stamp}.seg.nrrd")
+                if not slicer.util.saveNode(segmentationNode, segPath):
+                    raise RuntimeError(f"Could not save segmentation: {segPath}")
+                message += f"\n\nSegmentation:\n{segPath}"
+
+        except PermissionError as e:
+            slicer.util.errorDisplay(
+                f"No write permission for the output folder:\n{outputDir}\n\n{e}\n\n"
+                "Please choose another folder (e.g. in Documents).")
+            return
         except Exception as e:
-            print(f"[Dashboard export check] Could not read slice index: {e}")
+            slicer.util.errorDisplay(f"Export failed:\n{e}")
+            return
 
-        print(
-            f"[Dashboard export] workflow slice index: {workflowSliceIndex}, "
-            f"source slice index: {exportSourceSliceIndex}, "
-            f"dashboard/output slice index: {dashboardSliceIndex}, "
-            f"volume depth: {referenceDepth}"
-        )
+        self.statusLabel.text = message
+        print("[CSV export] " + message.replace("\n", " "))
 
-        
-        self.logic.saveDashboardVolumeForSlice(
-            fatNode,
-            os.path.join(niftiDir, "fat.nii"),
-            sourceSliceIndex=exportSourceSliceIndex,
-            outputSliceIndex=dashboardSliceIndex
-        )
-
-        if waterNode:
-            self.logic.saveDashboardVolumeForSlice(
-                waterNode,
-                os.path.join(niftiDir, "water.nii"),
-                sourceSliceIndex=exportSourceSliceIndex,
-                outputSliceIndex=dashboardSliceIndex
-            )
-
-        # Export a dashboard-compatible segmentation NRRD.
-        # The dashboard reads labels by SegmentName/LabelValue and does not
-        # reliably handle overlapping Slicer segmentation layers. Therefore,
-        # a flat labelmap with fixed, unique label values is written here.
-        referenceNode = fatNode
-        self.logic.exportDashboardSegmentationNRRD(
-            segmentationNode,
-            referenceNode,
-            os.path.join(niftiDir, "seg_corrected.seg.nrrd"),
-            sliceIndex=exportSourceSliceIndex,
-            outputSliceIndex=dashboardSliceIndex
-        )
-
-        outputPath = os.path.join(outputDir, "body_composition_results.csv")
-        self.logic.exportMetrics(metrics, outputPath)
-
-        self.statusLabel.text = f"Metrics exported to dashboard folder: {outputPath}"
-
-    def onOpenDashboard(self):
-        """Start the local dashboard application."""
-        try:
-            self.logic.launchDashboard()
-            self.statusLabel.text = "Dashboard launched."
-        except Exception as e:
-            slicer.util.errorDisplay(f"Failed to launch dashboard: {str(e)}")
-
+    def onOpenOutputFolder(self):
+        """Open the CSV output folder in the file explorer."""
+        outputDir = self.outputDirSelector.currentPath.strip()
+        if not outputDir:
+            return
+        os.makedirs(outputDir, exist_ok=True)
+        qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(outputDir))
 
     def onResetWorkflow(self):
         """Reset the scene and UI selectors for a new patient/workflow run."""
@@ -1158,7 +1113,7 @@ class KSW_SemiAutomatic_BCW_moduleLogic(ScriptedLoadableModuleLogic):
     The widget class handles user interaction. This logic class contains reusable
     functions for DICOM loading, slice-index detection, segment creation,
     single-slice thresholding, logical segment operations, metric calculation and
-    dashboard launching.
+    CSV export.
     """
     # Default segment names and display colors used throughout the workflow.
     DEFAULT_SEGMENTS = {
@@ -1591,7 +1546,7 @@ class KSW_SemiAutomatic_BCW_moduleLogic(ScriptedLoadableModuleLogic):
                 # The nearby Muscle mask is used only as a temporary source mask.
                 # The fat threshold and the final IMAT segment stay on the original
                 # selected slice, so SAT, VAT, Muscle and IMAT appear together in
-                # Slicer and in the dashboard.
+                # Slicer and in the CSV export.
                 muscleMask2d = muscleArray[int(bestIndex), :, :] > 0
                 musclePixels = int(np.sum(muscleMask2d))
             else:
@@ -1648,7 +1603,7 @@ class KSW_SemiAutomatic_BCW_moduleLogic(ScriptedLoadableModuleLogic):
         or after IMAT was created from a neighbouring Muscle mask. Therefore,
         this function first searches a small neighbourhood around the selected
         slice and uses the slice with the largest amount of workflow
-        segmentation pixels. This keeps the Slicer view, metrics and dashboard
+        segmentation pixels. This keeps the Slicer view, metrics and CSV export
         export consistent without applying a fat/water offset.
         """
 
@@ -1854,328 +1809,47 @@ class KSW_SemiAutomatic_BCW_moduleLogic(ScriptedLoadableModuleLogic):
             slicer.mrmlScene.RemoveNode(editorNode)
 
 
-    # ── Dashboard export and launch helpers ───────────────────────────────────
-    def saveDashboardVolumeForSlice(self, volumeNode, filepath,
-                                    sourceSliceIndex=None,
-                                    outputSliceIndex=None):
-        """
-        Save a dashboard-compatible NIfTI volume.
+    # ── CSV export ────────────────────────────────────────────────────────────
+    # Format matches Swiss Excel: semicolon separator, decimal point, UTF-8 with BOM.
+    CSV_DELIMITER = ";"
 
-        Slicer arrays are ordered as [slice, y, x]. The dashboard expects NIfTI
-        arrays as [x, y, z] and displays image[:, :, z].T. Therefore the array is
-        transposed before saving so that the dashboard z-slider corresponds to the
-        Slicer slice index.
-        """
-        import nibabel as nib
-
-        if volumeNode is None:
-            raise ValueError("No volume node provided.")
-
-        volumeArrayKJI = slicer.util.arrayFromVolume(volumeNode)
-        depth = volumeArrayKJI.shape[0]
-
-        # Convert from Slicer array order [k, j, i] to dashboard/NIfTI order [i, j, k].
-        volumeArrayIJK = np.transpose(volumeArrayKJI, (2, 1, 0)).astype(np.float32)
-
-        # For very small 2D/3-slice datasets, optionally copy the selected source
-        # slice to the dashboard display slice.
-        if (
-            sourceSliceIndex is not None
-            and outputSliceIndex is not None
-            and depth <= 3
-            and int(sourceSliceIndex) != int(outputSliceIndex)
-        ):
-            sourceSliceIndex = int(np.clip(int(sourceSliceIndex), 0, depth - 1))
-            outputSliceIndex = int(np.clip(int(outputSliceIndex), 0, depth - 1))
-
-            volumeArrayIJK[:, :, outputSliceIndex] = volumeArrayIJK[:, :, sourceSliceIndex]
-
-            print(
-                f"[Dashboard export] Saved shifted dashboard volume: "
-                f"source slice {sourceSliceIndex} -> output slice {outputSliceIndex}"
-            )
-
-        # Simple identity affine is enough for dashboard visualization.
-        affine = np.eye(4)
-
-        niftiImage = nib.Nifti1Image(volumeArrayIJK, affine)
-        nib.save(niftiImage, filepath)
-
-        print(
-            f"[Dashboard export] Wrote dashboard-compatible volume: {filepath}, "
-            f"shape={volumeArrayIJK.shape}"
-        )
-    
-    def exportDashboardSegmentationNRRD(self, segmentationNode, referenceVolumeNode,
-                                    filepath, sliceIndex=None, outputSliceIndex=None):
-        """
-        Export a dashboard-compatible .seg.nrrd without changing the Slicer scene.
-
-        The dashboard reads one flat labelmap. A flat labelmap cannot store true
-        overlap, therefore IMAT would normally overwrite Muscle in the dashboard
-        and make the muscle mask look incomplete. To keep the dashboard file
-        compatible without editing dashboard.py, IMAT is exported with its own
-        label value and the header also exposes this label as an additional
-        muscle-type label (Autochthon_R). The dashboard already treats
-        Autochthon_R as skeletal muscle in the water panel, while still treating
-        the same label as IMAT in the fat panel.
-
-        Fixed label values:
-            SAT    = 65
-            Muscle = 66
-            VAT    = 67
-            IMAT   = 68
-        """
-        if segmentationNode is None:
-            raise ValueError("No segmentation node provided for dashboard export.")
-
-        if referenceVolumeNode is None:
-            raise ValueError("No reference volume provided for dashboard export.")
-
-        folder = os.path.dirname(filepath)
-        if folder and not os.path.exists(folder):
-            os.makedirs(folder)
-
-        referenceArray = slicer.util.arrayFromVolume(referenceVolumeNode)
-
-        # Slicer array order is [k, j, i]
-        kSize, jSize, iSize = referenceArray.shape
-
-        # Dashboard reads arrays as [i, j, k] and displays [:, :, z].T
-        # Therefore, build the exported labelmap directly in [i, j, k].
-        combinedIJK = np.zeros((iSize, jSize, kSize), dtype=np.uint8)
-
-        if sliceIndex is not None:
-            sliceIndex = int(np.clip(int(sliceIndex), 0, kSize - 1))
-
-        if outputSliceIndex is None:
-            outputSliceIndex = sliceIndex
-
-        if outputSliceIndex is not None:
-            outputSliceIndex = int(np.clip(int(outputSliceIndex), 0, kSize - 1))
-
-        labelValues = {
-            "SAT": 65,
-            "Muscle": 66,
-            "VAT": 67,
-            "IMAT": 68,
-        }
-
-        colors = {
-            "SAT": "1 1 0",
-            "Muscle": "0.8 0.2 0.2",
-            "VAT": "1 0.5 0",
-            "IMAT": "0.4 1 0.4",
-            "Autochthon_R": "0.8 0.2 0.2",
-        }
-
-        exportOrder = ["SAT", "VAT", "Muscle", "IMAT"]
-        segmentation = segmentationNode.GetSegmentation()
-
-        for segmentName in exportOrder:
-            segmentId = segmentation.GetSegmentIdBySegmentName(segmentName)
-
-            if not segmentId:
-                print(f"[Dashboard export] Segment not found, skipped: {segmentName}")
-                continue
-
-            segmentArray = slicer.util.arrayFromSegmentBinaryLabelmap(
-                segmentationNode,
-                segmentId,
-                referenceVolumeNode
-            )
-
-            if sliceIndex is not None:
-                # Take the real workflow slice in Slicer order [j, i]
-                mask2dJI = segmentArray[sliceIndex, :, :] > 0
-
-                # Convert to dashboard order [i, j]
-                mask2dIJ = mask2dJI.T
-
-                pixels = int(np.sum(mask2dIJ))
-
-                if pixels == 0:
-                    print(
-                        f"[Dashboard export] Segment is empty on export slice "
-                        f"{sliceIndex}: {segmentName}"
-                    )
-                    continue
-
-                combinedIJK[:, :, outputSliceIndex][mask2dIJ] = labelValues[segmentName]
-
+    @staticmethod
+    def _formatRow(metricsDict):
+        row = {}
+        for key, value in metricsDict.items():
+            if isinstance(value, (float, np.floating)):
+                row[key] = f"{float(value):.2f}"
+            elif isinstance(value, np.integer):
+                row[key] = int(value)
             else:
-                maskKJI = segmentArray > 0
-                pixels = int(np.sum(maskKJI))
-
-                if pixels == 0:
-                    print(f"[Dashboard export] Segment is empty: {segmentName}")
-                    continue
-
-                maskIJK = np.transpose(maskKJI, (2, 1, 0))
-                combinedIJK[maskIJK] = labelValues[segmentName]
-
-            print(
-                f"[Dashboard export] {segmentName}: label {labelValues[segmentName]}, "
-                f"pixels {pixels}"
-            )
-
-        # Debug: show which labels are really present on each exported dashboard slice.
-        for z in range(combinedIJK.shape[2]):
-            uniqueLabels = np.unique(combinedIJK[:, :, z])
-            if len(uniqueLabels) > 1:
-                print(f"[Dashboard export debug] z={z}, labels={uniqueLabels}")
-
-        spacing = referenceVolumeNode.GetSpacing()
-        origin = referenceVolumeNode.GetOrigin()
-        sizes = combinedIJK.shape
-
-        # Autochthon_R is a header-only alias for the IMAT label value. The
-        # dashboard already includes Autochthon_R in the muscle label list.
-        segmentHeader = [
-            ("SAT", labelValues["SAT"], colors["SAT"]),
-            ("Muscle", labelValues["Muscle"], colors["Muscle"]),
-            ("VAT", labelValues["VAT"], colors["VAT"]),
-            ("IMAT", labelValues["IMAT"], colors["IMAT"]),
-            ("Autochthon_R", labelValues["IMAT"], colors["Autochthon_R"]),
-        ]
-
-        headerLines = [
-            "NRRD0005",
-            "# Dashboard-compatible segmentation exported from 3D Slicer",
-            "type: unsigned char",
-            "dimension: 3",
-            f"sizes: {sizes[0]} {sizes[1]} {sizes[2]}",
-            "encoding: raw",
-            "endian: little",
-            "kinds: domain domain domain",
-            f"space directions: ({spacing[0]},0,0) (0,{spacing[1]},0) (0,0,{spacing[2]})",
-            f"space origin: ({origin[0]},{origin[1]},{origin[2]})",
-        ]
-
-        for i, (segmentName, labelValue, color) in enumerate(segmentHeader):
-            headerLines.extend([
-                f"Segment{i}_ID:=Segment_{i + 1}",
-                f"Segment{i}_Name:={segmentName}",
-                f"Segment{i}_Layer:=0",
-                f"Segment{i}_LabelValue:={labelValue}",
-                f"Segment{i}_Color:={color}",
-            ])
-
-        headerText = "\n".join(headerLines) + "\n\n"
-
-        with open(filepath, "wb") as f:
-            f.write(headerText.encode("ascii"))
-            f.write(combinedIJK.tobytes(order="F"))
-
-        print(f"[Dashboard export] Wrote dashboard-compatible segmentation: {filepath}")
-
+                row[key] = value
+        return row
 
     def exportMetrics(self, metricsDict, filepath):
-        """
-        Exports metrics as one CSV row with column headers.
-
-        """
-
+        """Write the metrics of one patient as a CSV file (header + one row)."""
         folder = os.path.dirname(filepath)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
 
-        if folder and not os.path.exists(folder):
-            os.makedirs(folder)
-
-        with open(filepath, "w", newline="") as f:
-            writer = csv.DictWriter( f, fieldnames=metricsDict.keys())
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(metricsDict.keys()),
+                                    delimiter=self.CSV_DELIMITER)
             writer.writeheader()
-            writer.writerow(metricsDict)
+            writer.writerow(self._formatRow(metricsDict))
 
-    def launchDashboard(self):
-        """Start the Panel dashboard with the exported dashboard slice index."""
-        scriptDir = os.path.dirname(os.path.abspath(__file__))
-        dashboardDir = os.path.join(scriptDir, "Dashboard")
-        dashboardScript = os.path.join(dashboardDir, "dashboard.py")
-        patientDir = os.path.join(dashboardDir, "current_patient")
-        outputDir = os.path.join(patientDir, "output")
+    def appendMetrics(self, metricsDict, filepath):
+        """Append one row to the cumulative CSV (header is written once)."""
+        writeHeader = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
+        fieldnames = list(metricsDict.keys())
+        if not writeHeader:
+            with open(filepath, "r", newline="", encoding="utf-8-sig") as f:
+                existing = next(csv.reader(f, delimiter=self.CSV_DELIMITER), [])
+            if existing:
+                fieldnames = existing + [k for k in metricsDict if k not in existing]
 
-        if not os.path.exists(dashboardScript):
-            raise FileNotFoundError(f"Dashboard file not found: {dashboardScript}")
-
-        csvPath = os.path.join(outputDir, "body_composition_results.csv")
-        if not os.path.exists(csvPath):
-            raise FileNotFoundError(
-                "Dashboard input not found. Please run 'Compute Metrics + Export to Dashboard' first."
-            )
-
-        # Read the slice written during export.
-        sliceIndexPath = os.path.join(outputDir, "dashboard_start_slice.txt")
-        sliceIndex = 0
-
-        if os.path.exists(sliceIndexPath):
-            try:
-                with open(sliceIndexPath, "r", encoding="utf-8") as f:
-                    sliceIndex = int(f.read().strip())
-
-                print(
-                    f"[Dashboard launch] Using dashboard_start_slice.txt: "
-                    f"z={sliceIndex}"
-                )
-
-            except Exception as e:
-                print(
-                    f"[Dashboard launch] Could not read dashboard_start_slice.txt: {e}"
-                )
-                print("[Dashboard launch] Falling back to z=0.")
-
-        else:
-            print(
-                "[Dashboard launch] dashboard_start_slice.txt not found. "
-                "Falling back to z=0."
-            )
-
-        env = os.environ.copy()
-        env.pop("PYTHONHOME", None)
-        env.pop("PYTHONPATH", None)
-
-        if os.name == "nt":
-            batPath = os.path.join(dashboardDir, "start_dashboard_from_slicer.bat")
-
-            with open(batPath, "w", encoding="utf-8") as f:
-                f.write("@echo off\n")
-                f.write("set PYTHONHOME=\n")
-                f.write("set PYTHONPATH=\n")
-                f.write(f'cd /d "{dashboardDir}"\n')
-                f.write(f'echo Starting dashboard with z={sliceIndex}\n')
-
-                # Stop old Panel servers on port 5006.
-                f.write(
-                    'powershell -NoProfile -Command '
-                    '"Get-NetTCPConnection -LocalPort 5006 -State Listen -ErrorAction SilentlyContinue '
-                    '| ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }"\n'
-                )
-                # Important: --z is passed after --args.
-                f.write(
-                    f'py -3.13 -m panel serve dashboard.py --port 5006 '
-                    f'--args --patient "{patientDir}" --z {sliceIndex}\n'
-                )
-
-            subprocess.Popen(
-                ["cmd.exe", "/c", batPath],
-                cwd=dashboardDir,
-                env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-
-        else:
-            pythonExe = shutil.which("python")
-            if not pythonExe:
-                raise RuntimeError("No external Python executable found in PATH.")
-
-            command = [
-                pythonExe, "-m", "panel", "serve",
-                dashboardScript,
-                "--port", "5006",
-                "--args",
-                "--patient", patientDir,
-                "--z", str(sliceIndex),
-            ]
-            subprocess.Popen(command, cwd=dashboardDir, env=env)
-
-        time.sleep(4)
-        webbrowser.open(f"http://localhost:5006/dashboard?t={int(time.time())}")
+        with open(filepath, "a", newline="", encoding="utf-8-sig" if writeHeader else "utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore",
+                                    delimiter=self.CSV_DELIMITER)
+            if writeHeader:
+                writer.writeheader()
+            writer.writerow(self._formatRow(metricsDict))
